@@ -1,0 +1,95 @@
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk17'
+        nodejs 'node20'
+    }
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        GIT_CREDENTIALS_ID = 'PAT_Jenkins' // Updated credentials ID
+    }
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                          userRemoteConfigs: [[url: 'https://github.com/0sifat/p_mart_ecom-main.git', credentialsId: GIT_CREDENTIALS_ID]],
+                          branches: [[name: '*/main']]
+                ])
+            }
+        }
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh '''$SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Amazon \
+                    -Dsonar.projectKey=Amazon'''
+                }
+            }
+        }
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+                }
+            }
+        }
+        stage('Install Dependencies') {
+            steps {
+                // Install dependencies and handle potential errors
+                sh '''
+                    npm install --legacy-peer-deps || true
+                    npm install react@18.2.0 react-dom@18.2.0 || true
+                    npm audit fix --force || true
+                '''
+            }
+        }
+        stage('OWASP FS Scan') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+        stage('Trivy FS Scan') {
+            steps {
+                sh "trivy fs . > trivyfs.txt"
+            }
+        }
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
+                        sh "docker build -t amazon ."
+                        sh "docker tag amazon sifat198/amazon:latest"
+                        sh "docker push sifat198/amazon:latest"
+                    }
+                }
+            }
+        }
+        stage('Trivy Image Scan') {
+            steps {
+                sh "trivy image --timeout 10m sifat198/amazon:latest > trivyimage.txt"  // Adjust the time as needed
+            }
+        }
+        stage('Deploy to Container') {
+            steps {
+                script {
+                    // Stop and remove existing container if it exists
+                    sh '''
+                        if [ "$(docker ps -q -f name=amazon)" ]; then
+                            docker stop amazon
+                        fi
+                        if [ "$(docker ps -aq -f status=exited -f name=amazon)" ]; then
+                            docker rm amazon
+                        fi
+                    '''
+                    // Deploy the new container
+                    sh 'docker run -d --name amazon -p 3000:3000 sifat198/amazon:latest'
+                }
+            }
+        }
+    }
+}
